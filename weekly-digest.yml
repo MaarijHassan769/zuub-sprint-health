@@ -1,0 +1,30 @@
+name: Weekly Stuck Ticket Digest
+
+on:
+  schedule:
+    # 9:00 AM every Monday, US/Eastern (13:00 UTC covers EST; adjust for
+    # your team's timezone / DST as needed, or use 14:00 UTC for EDT)
+    - cron: "0 13 * * 1"
+  workflow_dispatch: {}  # allows manual "Run workflow" button in GitHub UI
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run digest
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ secrets.JIRA_PROJECT_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: python3 digest.py
