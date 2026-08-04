@@ -3,8 +3,8 @@
 Weekly Stuck-Ticket Digest — Jira -> Slack
 
 Pulls all open-sprint tickets for a Jira project, applies stall-detection
-rules (sprint carryover, story-point-scaled time-in-status, blocked/clarify
-staleness), and posts a formatted digest to a Slack channel.
+rules (2+ sprints in the same status, excluding recently created tickets;
+blocked/clarify/on-hold staleness), and posts a formatted digest to Slack.
 
 Run manually:
     python3 digest.py
@@ -38,43 +38,21 @@ import requests
 # Config — thresholds agreed with the team. Adjust here as norms change.
 # ---------------------------------------------------------------------------
 
-# Sprint-carryover: how many sprints a ticket can be dragged across before
-# it's always flagged, regardless of current status.
-CARRYOVER_THRESHOLD = {
-    "High": 2,
-    "Highest": 2,
-    "Medium": 3,
-    "Low": 3,
-    "Lowest": 3,
-}
-DEFAULT_CARRYOVER_THRESHOLD = 3
+# Sprint length in days — used to convert "2+ sprints" into a day count.
+# Adjust this if your team's sprints aren't 2 weeks.
+SPRINT_LENGTH_DAYS = 14
 
-# Active-work statuses where time-in-status is scaled by story points.
-ACTIVE_STATUSES = {
-    "Dev In Progress",
-    "Code Review",
-    "Testing To Do",
-    "Testing In Progress",
-}
+# A ticket is "stuck" if its CURRENT status hasn't changed in this many days
+# (default: 2 sprints' worth of days).
+STUCK_STATUS_THRESHOLD_DAYS = 2 * SPRINT_LENGTH_DAYS
 
-# Story-point-scaled day thresholds for ACTIVE_STATUSES.
-def days_threshold_for_points(points):
-    if points is None:
-        points = 3  # assume medium if unestimated
-    if points <= 2:
-        return 3
-    elif points <= 5:
-        return 5
-    else:
-        return 8
+# Don't flag tickets that were only just created — give them a full sprint
+# before they're eligible to show up in the digest at all.
+NEW_TICKET_GRACE_DAYS = SPRINT_LENGTH_DAYS
 
 # Statuses that need a human keep/defer/backlog decision, not just a nudge.
 ACTION_REQUIRED_STATUSES = {"Blocked", "Clarify", "On Hold"}
 ACTION_REQUIRED_MIN_DAYS = 3  # don't flag same-day entries
-
-# "Dev To Do" is a To-Do bucket but flagged same as carryover if it repeats
-# across multiple sprints (ticket keeps getting bumped before dev starts).
-TODO_CARRYOVER_STATUS = "Dev To Do"
 
 PRIORITY_SORT_ORDER = {"Highest": 0, "High": 1, "Medium": 2, "Low": 3, "Lowest": 4}
 
@@ -101,7 +79,7 @@ def fetch_open_sprint_issues(session, base_url, project_key):
     )
     issues = []
     next_page_token = None
-    fields = ["summary", "status", "assignee", "priority", "issuetype",
+    fields = ["summary", "status", "assignee", "priority", "issuetype", "created",
               "customfield_10020", "customfield_10064"]  # Sprint, Story Points
     # NOTE: customfield IDs for Sprint / Story Points are workspace-specific.
     # Confirm these against your instance (we found 10020 / 10064 for Zuub's
@@ -172,14 +150,7 @@ def analyze_issue(issue, histories, now):
             if item.get("field") == "status" and item.get("toString") == status_name:
                 status_entered_at = parse_jira_ts(h["created"])
     days_in_status = (now - status_entered_at).days if status_entered_at else 0
-
-    # --- sprint carryover count: distinct sprint IDs ever attached ---
-    max_sprint_count = 0
-    for h in histories_sorted:
-        for item in h.get("items", []):
-            if item.get("field") == "Sprint" and item.get("to"):
-                count = len([s for s in item["to"].split(",") if s.strip()])
-                max_sprint_count = max(max_sprint_count, count)
+    days_since_created = (now - created).days if created else 0
 
     return {
         "key": key,
@@ -189,28 +160,28 @@ def analyze_issue(issue, histories, now):
         "assignee": assignee_name,
         "story_points": story_points,
         "days_in_status": days_in_status,
-        "sprint_carryover": max_sprint_count,
+        "days_since_created": days_since_created,
     }
 
 
 def classify(analyzed):
     """Return ('stuck', reason_str) or ('action_required', reason_str) or None."""
-    carryover_limit = CARRYOVER_THRESHOLD.get(analyzed["priority"], DEFAULT_CARRYOVER_THRESHOLD)
 
-    # Rule 1 + 2: sprint carryover (any status) or Dev To Do carryover
-    if analyzed["sprint_carryover"] >= carryover_limit:
-        return "stuck", f"Carried {analyzed['sprint_carryover']} sprints"
+    # Skip brand-new tickets entirely — give them a full sprint before
+    # they're even eligible to be flagged, regardless of status.
+    if analyzed["days_since_created"] < NEW_TICKET_GRACE_DAYS:
+        return None, None
 
-    # Rule 3: active-work statuses, story-point scaled
-    if analyzed["status"] in ACTIVE_STATUSES:
-        limit = days_threshold_for_points(analyzed["story_points"])
-        if analyzed["days_in_status"] > limit:
-            return "stuck", (
-                f"{analyzed['status']}, {analyzed['days_in_status']} days "
-                f"(limit {limit}d for {analyzed['story_points'] or '?'} pts)"
-            )
+    # Rule 1: current status hasn't changed in 2+ sprints' worth of days —
+    # this is the single "forgotten tradeoff ticket" signal.
+    if analyzed["days_in_status"] >= STUCK_STATUS_THRESHOLD_DAYS:
+        sprints_approx = round(analyzed["days_in_status"] / SPRINT_LENGTH_DAYS, 1)
+        return "stuck", (
+            f"{analyzed['status']} for {analyzed['days_in_status']} days "
+            f"(~{sprints_approx} sprints)"
+        )
 
-    # Rule 4: blocked/clarify/on hold -> action required, once stale
+    # Rule 2: blocked/clarify/on hold -> action required, once stale
     if analyzed["status"] in ACTION_REQUIRED_STATUSES:
         if analyzed["days_in_status"] >= ACTION_REQUIRED_MIN_DAYS:
             return "action_required", f"{analyzed['status']}, {analyzed['days_in_status']} days"
